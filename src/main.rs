@@ -34,28 +34,51 @@
 //!    seed, illustrating how a downstream user would shop for a
 //!    seed that best fits their criteria.
 //!
+//! 5. Full per-table reports for those who want to see the complete
+//!    `TableQualityReport` rather than the side-by-side delta table.
+//!
+//! 6. **The table finder** (`table_finder`): builds a corpus of
+//!    pseudo-random 8×8 chess boards, sweeps 10,000 Fisher-Yates
+//!    seeds against that corpus, refines the top 20 leaders with
+//!    single-bit-flip perturbation, and prints the leaderboard.
+//!    The leaderboard is also saved to a timestamped file so the
+//!    user can come back to it later. The intended workflow is
+//!    "run this, read the leaderboard, copy a winning hex seed,
+//!    hard-code it in production."
+//!
+//! ## CLI Flag
+//!
+//! `--reproducible` (optional, anywhere in `argv`): tells the table
+//! finder to use a fixed meta-seed instead of one derived from the
+//! system clock. With the flag, the same search trajectory is
+//! repeated every run; without it, each run explores a different
+//! search region, which is what you want when shopping seeds.
+//!
 //! ## Heap Usage in This File
 //!
 //! This is demo / sample-print code, not production. Per project
 //! rules, heap (`println!`, `String`, `Vec`) is acceptable here. The
 //! production hashing functions called from this file do not
-//! themselves allocate; only the demo scaffolding does.
+//! themselves allocate; only the demo scaffolding and the
+//! tools/finder modules do.
 //!
 //! ## Error Handling
 //!
 //! `main` returns `Result<(), std::io::Error>` so that any error
-//! from the hashing functions propagates cleanly. None of the calls
-//! here should error in practice (inputs are non-empty, salt array
-//! is non-empty), but we handle the `Result` explicitly rather than
-//! using `unwrap`, per project rules.
+//! from the hashing or finder functions propagates cleanly. None of
+//! the calls here should error in practice (inputs are non-empty,
+//! salt array is non-empty, corpus is non-empty), but we handle
+//! the `Result` explicitly rather than using `unwrap`, per project
+//! rules.
 
-// Module declarations. The production module and the tools module
-// are both compiled into this binary.
-
+// Module declarations. All three modules are compiled into this binary.
 mod pearson_hash_salt_array_rust;
 mod pearson_hash_tools;
+mod table_finder;
 
+use std::env;
 use std::io::Error;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use pearson_hash_salt_array_rust::{
     GENERATED_TABLE, PEARSON_1990_TABLE, pearson_hash_base, pearson_hash_salt_array,
@@ -66,18 +89,23 @@ use pearson_hash_tools::{
     print_table_evaluation_report,
 };
 
+use table_finder::{
+    RankBy, SaltArrayConfig, SweepMode, build_chess_corpus_sample, print_and_save_search_report,
+    search_seeds,
+};
+
 // =============================================================================
-// Constants for the demo
+// Constants — existing demo (sections 1-5)
 // =============================================================================
 
-/// The sample input used throughout the demo.
+/// The sample input used throughout sections 1-2.
 ///
 /// Project-level note: chosen to be a short ASCII string that is
 /// long enough to exercise the Pearson loop meaningfully (more than
 /// one byte) and short enough to keep stdout output readable.
 const DEMO_INPUT: &[u8] = b"Hello, World is the first onasei!";
 
-/// Four salts used for the salt-array demo.
+/// Four salts used for the salt-array demo in section 2.
 ///
 /// Project-level note: the values are arbitrary but deliberately
 /// well-separated bit patterns so the four output bytes are very
@@ -91,7 +119,7 @@ const DEMO_SALTS: [u128; 4] = [
     0xDEAD_BEEF_CAFE_BABE_1234_5678_9ABC_DEF0,
 ];
 
-/// Seeds used in the closing seed-sweep demonstration.
+/// Seeds used in the closing seed-sweep demonstration (section 4).
 ///
 /// Project-level note: these are illustrative only. A real user
 /// shopping for a seed would sweep hundreds or thousands of seeds
@@ -106,6 +134,55 @@ const SWEEP_SEEDS: [u64; 8] = [
     0xFFFF_FFFF_FFFF_FFFF,
     0x1234_5678_9ABC_DEF0,
     0xA5A5_A5A5_5A5A_5A5A,
+];
+
+// =============================================================================
+// Constants — table-finder demo (section 6)
+// =============================================================================
+
+/// Number of chess-board samples in the finder corpus.
+///
+/// Project-level note: 5,000 is large enough to produce stable
+/// rankings and small enough to keep the phase-1 sweep fast
+/// (under a second per thousand seeds on a modern CPU).
+const FINDER_CORPUS_SIZE: usize = 5_000;
+
+/// Seed used to build the deterministic chess corpus.
+///
+/// Project-level note: distinct from the search meta-seed. Fixed
+/// so the corpus itself is the same across runs; only the search
+/// trajectory varies. This makes results comparable across runs.
+const FINDER_CORPUS_SEED: u64 = 0xC4E5_5C0F_FEEC_0DE5;
+
+/// Number of Fisher-Yates seeds the finder evaluates in phase 1.
+///
+/// Project-level note: 10,000 is a sensible default. Typical
+/// runtime is 10–30 seconds. Increase for broader exploration.
+const FINDER_SEED_COUNT: u64 = 10_000;
+
+/// Meta-seed used when `--reproducible` is passed.
+///
+/// Project-level note: without the flag, the meta-seed is derived
+/// from `SystemTime` so each run explores a different region of
+/// the seed space. With the flag, the meta-seed is fixed so the
+/// search trajectory is identical across runs — useful when the
+/// user wants to reproduce a previously-seen result.
+const FINDER_FIXED_META_SEED: u64 = 0xFEED_FACE_DEAD_BEEF;
+
+/// Top-K leaderboard size for the finder.
+const FINDER_TOP_K: usize = 20;
+
+/// Salts used for the salt-array part of the finder.
+///
+/// Project-level note: four salts is sufficient to demonstrate
+/// the salt-array collision metric. Fewer than `MAX_SALTS = 8`,
+/// so the remaining internal slots are zero-padded; this
+/// padding is documented in `table_finder::SaltArrayConfig`.
+const FINDER_SALTS: [u128; 4] = [
+    0x0000_0000_0000_0000_0000_0000_0000_0001,
+    0x0000_0000_0000_0000_FFFF_FFFF_FFFF_FFFF,
+    0xAAAA_AAAA_AAAA_AAAA_5555_5555_5555_5555,
+    0xDEAD_BEEF_CAFE_BABE_1234_5678_9ABC_DEF0,
 ];
 
 // =============================================================================
@@ -130,7 +207,7 @@ fn format_hash_bytes(bytes: &[u8]) -> String {
 }
 
 // =============================================================================
-// Demo sections
+// Demo sections 1-5 (the original demos)
 // =============================================================================
 
 /// Section 1: base Pearson hash on both tables.
@@ -230,7 +307,8 @@ fn demo_section_comparative_report() {
 /// Project-level note: for each seed, we generate a Fisher-Yates
 /// table, evaluate it, and print one summary line. A real seed
 /// sweep would iterate over thousands of seeds and pick the
-/// winner on a chosen criterion; this is illustrative.
+/// winner on a chosen criterion; this is illustrative. Section 6
+/// performs a real large-scale sweep against a chess-board corpus.
 fn demo_section_seed_sweep() {
     println!("================================================================");
     println!(" Section 4: seed sweep (illustrative, 8 seeds)");
@@ -245,7 +323,6 @@ fn demo_section_seed_sweep() {
         "-".repeat(20 + 2 + 3 + 2 + 4 + 2 + 8 + 2 + 11 + 2 + 10)
     );
 
-    // Baseline row: the 1990 table, for comparison.
     let baseline = evaluate_table(&PEARSON_1990_TABLE);
     println!(
         "{:>20}  {:>3}  {:>4}  {:>8.3}  {:>11.2}  {:>10}",
@@ -285,12 +362,11 @@ fn demo_section_seed_sweep() {
     println!("To shop for a seed for your production use, sweep many seeds,");
     println!("call evaluate_table() on each, and select by the metric that");
     println!("matters most for your data. Then hard-code the winning seed.");
+    println!("Section 6 demonstrates this at scale against a chess corpus.");
     println!();
 }
 
-/// Section 5 (optional): full per-table report for those who want
-/// to see the complete `TableQualityReport` rather than the
-/// side-by-side delta table.
+/// Section 5: full per-table report for both shipped tables.
 fn demo_section_full_reports() {
     println!("================================================================");
     println!(" Section 5: full single-table reports");
@@ -301,6 +377,122 @@ fn demo_section_full_reports() {
 }
 
 // =============================================================================
+// Demo section 6: chess-board table finder
+// =============================================================================
+
+/// Derive a meta-seed from the system clock.
+///
+/// Project-level note: when the user does not pass `--reproducible`,
+/// we want each run of the finder to explore a different region of
+/// the seed space. The seconds-since-epoch value is mixed through a
+/// splitmix64 step so neighbouring runtimes give well-separated
+/// seeds, not adjacent ones.
+fn time_derived_meta_seed() -> u64 {
+    let secs: u64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut s: u64 = secs ^ 0x9E37_79B9_7F4A_7C15;
+    s = (s ^ (s >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    s = (s ^ (s >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    s ^ (s >> 31)
+}
+
+/// Section 6: search for a Pearson permutation table that performs
+/// well on an 8×8 chess-board byte-array corpus.
+///
+/// ## Project-Level Context
+///
+/// This section demonstrates the headline use case for the table
+/// finder. It:
+///
+/// 1. Builds a deterministic 5,000-board chess corpus (8×8 = 64
+///    bytes per board, drawn from the chess alphabet).
+/// 2. Runs the three-phase search against 10,000 Fisher-Yates
+///    seeds with a meta-seed that is either time-derived (default,
+///    different region each run) or fixed (with `--reproducible`).
+/// 3. Prints the top-20 leaderboard and the perturbation-refined
+///    top-20 to stdout, and saves the same text to
+///    `perm_test_{timestamp}.txt`.
+///
+/// ## Arguments
+///
+/// * `reproducible` — if true, use `FINDER_FIXED_META_SEED`;
+///   otherwise derive the meta-seed from the system clock.
+fn demo_section_table_finder(reproducible: bool) -> Result<(), Error> {
+    println!("================================================================");
+    println!(" Section 6: Pearson table search for chess-board corpus");
+    println!("================================================================");
+    println!();
+    println!("Building chess-board corpus...");
+    let boards = build_chess_corpus_sample(FINDER_CORPUS_SEED, FINDER_CORPUS_SIZE);
+    let corpus: Vec<&[u8]> = boards.iter().map(|b| b.as_slice()).collect();
+    println!(
+        "  {} boards, {} bytes each (8x8 squares, chess alphabet)",
+        corpus.len(),
+        corpus[0].len()
+    );
+
+    let salt_config = SaltArrayConfig {
+        salts: FINDER_SALTS.to_vec(),
+    };
+
+    let meta_seed: u64 = if reproducible {
+        FINDER_FIXED_META_SEED
+    } else {
+        time_derived_meta_seed()
+    };
+
+    println!(
+        "Searching {} seeds; meta_seed = 0x{:016X}{}",
+        FINDER_SEED_COUNT,
+        meta_seed,
+        if reproducible {
+            " (reproducible)"
+        } else {
+            " (time-derived)"
+        },
+    );
+    println!("This typically takes 10–30 seconds. The same run twice with");
+    println!("--reproducible will produce identical results; without the flag,");
+    println!("each run explores a different region of the seed space.");
+    println!();
+
+    let report = search_seeds(
+        &corpus,
+        Some(&salt_config),
+        SweepMode::PseudoRandom {
+            meta_seed,
+            count: FINDER_SEED_COUNT,
+        },
+        RankBy::BaseCollisions,
+        FINDER_TOP_K,
+    )?;
+
+    print_and_save_search_report(&report)?;
+    println!();
+    println!("To use a chosen seed in production: copy its hex value from the");
+    println!("leaderboard above and place it where you currently use the");
+    println!("default GENERATED_TABLE seed (0x9E3779B97F4A7C15).");
+    println!();
+
+    Ok(())
+}
+
+// =============================================================================
+// CLI parsing
+// =============================================================================
+
+/// Parse the command line for the `--reproducible` flag.
+///
+/// Project-level note: deliberately minimal CLI parsing — no
+/// third-party crate, no subcommand engine, no positional args.
+/// Returns `true` if the flag is present anywhere in `argv`.
+fn parse_cli_reproducible_flag() -> bool {
+    env::args().any(|arg| arg == "--reproducible")
+}
+
+// =============================================================================
 // main
 // =============================================================================
 
@@ -308,9 +500,11 @@ fn demo_section_full_reports() {
 ///
 /// Project-level note: each section is independent and prints its
 /// own header, so the output reads top-to-bottom as a self-explaining
-/// transcript. Any error from a hashing call is propagated; the
-/// process exits non-zero on error rather than panicking.
+/// transcript. Any error from a hashing or finder call is propagated;
+/// the process exits non-zero on error rather than panicking.
 fn main() -> Result<(), Error> {
+    let reproducible = parse_cli_reproducible_flag();
+
     println!();
     println!("################################################################");
     println!("#                                                              #");
@@ -318,6 +512,12 @@ fn main() -> Result<(), Error> {
     println!("#                                                              #");
     println!("#   This is a demonstration of the crate's production          #");
     println!("#   functions and its table-quality measurement tools.         #");
+    println!("#                                                              #");
+    if reproducible {
+        println!("#   Flag detected: --reproducible (fixed finder meta-seed)     #");
+    } else {
+        println!("#   Tip: pass --reproducible to use a fixed finder meta-seed   #");
+    }
     println!("#                                                              #");
     println!("################################################################");
     println!();
@@ -327,6 +527,7 @@ fn main() -> Result<(), Error> {
     demo_section_comparative_report();
     demo_section_seed_sweep();
     demo_section_full_reports();
+    demo_section_table_finder(reproducible)?;
 
     println!("================================================================");
     println!(" Demo complete.");
