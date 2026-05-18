@@ -77,7 +77,7 @@ mod pearson_hash_tools;
 mod table_finder;
 
 use std::env;
-use std::io::Error;
+use std::io::{self, BufRead, Error, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pearson_hash_salt_array_rust::{
@@ -90,8 +90,8 @@ use pearson_hash_tools::{
 };
 
 use table_finder::{
-    RankBy, SaltArrayConfig, SweepMode, build_chess_corpus_sample, print_and_save_search_report,
-    search_seeds,
+    RankBy, SaltArrayConfig, SweepMode, build_chess_corpus_sample, perturb_seed_search,
+    print_and_save_search_report, search_seeds,
 };
 
 // =============================================================================
@@ -171,6 +171,14 @@ const FINDER_FIXED_META_SEED: u64 = 0xFEED_FACE_DEAD_BEEF;
 
 /// Top-K leaderboard size for the finder.
 const FINDER_TOP_K: usize = 20;
+
+/// Number of worst-performing seeds to also report, for contrast
+/// against the top-K. Set to 0 to omit the worst section entirely.
+///
+/// Project-level note: seeing the worst alongside the best gives the
+/// user a concrete sense of the spread across the seed space, and
+/// of what a structurally poor table looks like.
+const FINDER_BOTTOM_K: usize = 5;
 
 /// Salts used for the salt-array part of the finder.
 ///
@@ -398,84 +406,283 @@ fn time_derived_meta_seed() -> u64 {
     s ^ (s >> 31)
 }
 
-/// Section 6: search for a Pearson permutation table that performs
-/// well on an 8×8 chess-board byte-array corpus.
+/// User's chosen mode for the section-6 table-finder run.
 ///
-/// ## Project-Level Context
+/// # Project-Level Context
 ///
-/// This section demonstrates the headline use case for the table
-/// finder. It:
+/// Section 6 is the most expensive part of the demo (a 10,000-seed
+/// sweep, typically 10-30 seconds). Different users want different
+/// things from it, and forcing every user through the same code path
+/// every time is wasteful. This enum is the result of the section-6
+/// prompt and tells `demo_section_table_finder` which branch to take.
+enum SectionSixMode {
+    /// Run the full random sweep against the chess-board corpus.
+    /// This is the default and what every previous version of this
+    /// demo did unconditionally.
+    FullRandomSweep,
+
+    /// Skip the full sweep. Instead, score the user-supplied 64-bit
+    /// seed and its 64 single-bit-flip neighbors, then print the
+    /// same report layout. Useful for refining a seed copied out of
+    /// a previous run's leaderboard.
+    PerturbSpecificSeed(u64),
+
+    /// Skip section 6 entirely. The rest of the demo (sections 1–5)
+    /// still runs.
+    Skip,
+}
+
+/// Interactively prompt the user for their section-6 choice.
 ///
-/// 1. Builds a deterministic 5,000-board chess corpus (8×8 = 64
-///    bytes per board, drawn from the chess alphabet).
-/// 2. Runs the three-phase search against 10,000 Fisher-Yates
-///    seeds with a meta-seed that is either time-derived (default,
-///    different region each run) or fixed (with `--reproducible`).
-/// 3. Prints the top-20 leaderboard and the perturbation-refined
-///    top-20 to stdout, and saves the same text to
-///    `perm_test_{timestamp}.txt`.
+/// # Project-Level Context
 ///
-/// ## Arguments
+/// Section 6 has three sensible modes (see `SectionSixMode`). This
+/// function asks one stdin question, optionally a follow-up for the
+/// hex seed, and returns the chosen mode. It never panics: any
+/// stdin read error is returned as an `io::Error`; any unparseable
+/// input falls back to the default mode with a printed notice.
 ///
-/// * `reproducible` — if true, use `FINDER_FIXED_META_SEED`;
-///   otherwise derive the meta-seed from the system clock.
-fn demo_section_table_finder(reproducible: bool) -> Result<(), Error> {
+/// # Bypass for Non-Interactive Runs
+///
+/// If `auto_mode` is `true` (typically set by the `--auto` CLI
+/// flag), the prompt is skipped entirely and `FullRandomSweep` is
+/// returned. This lets the demo run unattended in CI or with stdin
+/// redirected to `/dev/null`.
+///
+/// # Input Format
+///
+/// Menu choice: one of `1`, `2`, `3`, or empty (= `1`).
+/// Hex seed: any 64-bit hex value, with or without `0x`/`0X` prefix,
+/// case-insensitive. Leading and trailing whitespace are trimmed.
+///
+/// # Error Handling
+///
+/// Returns `io::Result<SectionSixMode>` so a broken stdin pipe
+/// propagates as an error rather than crashing the demo. The user's
+/// choices themselves never cause an error return; unparseable input
+/// falls back to `FullRandomSweep` with a notice printed to stdout.
+///
+/// # Arguments
+///
+/// * `auto_mode` — when `true`, bypass the prompt and return
+///   `FullRandomSweep`.
+///
+/// # Returns
+///
+/// `Ok(SectionSixMode)` on success; `Err(io::Error)` only on stdin
+/// I/O failure.
+fn prompt_for_section_six_mode(auto_mode: bool) -> io::Result<SectionSixMode> {
+    if auto_mode {
+        return Ok(SectionSixMode::FullRandomSweep);
+    }
+
+    // Render the menu. The default is option 1 so that pressing
+    // Enter (the most likely "I just want to see it work" action)
+    // produces the historical behavior of this demo.
+    println!("----------------------------------------------------------------");
+    println!(" Section 6 — table finder. Choose a mode:");
+    println!(
+        "   [1] (default)  Full random sweep (~{} seeds)",
+        FINDER_SEED_COUNT
+    );
+    println!("   [2]            Perturb a specific seed (you supply 64-bit hex)");
+    println!("   [3]            Skip section 6");
+    println!("----------------------------------------------------------------");
+    print!("Choice [1/2/3] (Enter = 1): ");
+    io::stdout().flush()?;
+
+    // Read the menu line. Stdin errors propagate to the caller.
+    let mut menu_line = String::new();
+    let stdin_handle = io::stdin();
+    stdin_handle.lock().read_line(&mut menu_line)?;
+    let menu_choice = menu_line.trim();
+
+    match menu_choice {
+        // Empty input or "1" -> default behavior.
+        "" | "1" => Ok(SectionSixMode::FullRandomSweep),
+
+        // Explicit skip.
+        "3" => Ok(SectionSixMode::Skip),
+
+        // Perturb-specific-seed path: read a second line for the hex.
+        "2" => {
+            print!(
+                "Enter 64-bit seed in hex (with or without 0x prefix, \
+                 e.g. 0xDEADBEEFCAFEBABE): "
+            );
+            io::stdout().flush()?;
+
+            let mut hex_line = String::new();
+            stdin_handle.lock().read_line(&mut hex_line)?;
+
+            // Normalize: trim whitespace, strip optional 0x/0X prefix.
+            let trimmed = hex_line
+                .trim()
+                .trim_start_matches("0x")
+                .trim_start_matches("0X");
+
+            match u64::from_str_radix(trimmed, 16) {
+                Ok(parsed_seed) => {
+                    println!("Using seed 0x{:016X} for perturbation.", parsed_seed);
+                    Ok(SectionSixMode::PerturbSpecificSeed(parsed_seed))
+                }
+                Err(_) => {
+                    // Per project rules: handle and move on. Do not
+                    // panic on bad user input; tell the user what
+                    // happened and fall back to the default.
+                    println!(
+                        "Could not parse '{}' as 64-bit hex. \
+                         Falling back to full random sweep.",
+                        trimmed
+                    );
+                    Ok(SectionSixMode::FullRandomSweep)
+                }
+            }
+        }
+
+        // Anything else: notify and fall back.
+        other => {
+            println!(
+                "Unrecognized menu choice '{}'. Falling back to full random sweep.",
+                other
+            );
+            Ok(SectionSixMode::FullRandomSweep)
+        }
+    }
+}
+
+/// Section 6: search for, or refine, a Pearson permutation table
+/// against an 8×8 chess-board byte-array corpus.
+///
+/// # Project-Level Context
+///
+/// This section is the demo's headline use case: given a corpus
+/// representative of the user's real data, find a Fisher-Yates seed
+/// whose generated permutation table performs well on that corpus.
+///
+/// The function dispatches on `mode`:
+///   - `FullRandomSweep`        → call `search_seeds` (the original
+///                                three-phase pipeline).
+///   - `PerturbSpecificSeed(s)` → call `perturb_seed_search` (only
+///                                Phase 3, against the user's seed).
+///   - `Skip`                   → print one line and return.
+///
+/// Both real branches print the same report layout, because both
+/// produce the same `SearchReport` struct.
+///
+/// # Arguments
+///
+/// * `reproducible` — if `true`, the full sweep uses a fixed
+///   meta-seed so two runs produce identical results. Ignored in
+///   the `PerturbSpecificSeed` branch (the user's seed is the
+///   determinism source there).
+/// * `mode` — what the user asked for at the section-6 prompt.
+///
+/// # Returns
+///
+/// `Ok(())` on success; `Err(io::Error)` if corpus construction,
+/// scoring, or file-saving fails.
+fn demo_section_table_finder(reproducible: bool, mode: SectionSixMode) -> Result<(), Error> {
     println!("================================================================");
     println!(" Section 6: Pearson table search for chess-board corpus");
     println!("================================================================");
     println!();
+
+    // Early exit for "skip" — printed message keeps the section's
+    // overall narrative consistent.
+    if matches!(mode, SectionSixMode::Skip) {
+        println!("Section 6 skipped by user request.");
+        println!();
+        return Ok(());
+    }
+
+    // Build the shared chess-board corpus. Both real modes need it.
     println!("Building chess-board corpus...");
     let boards = build_chess_corpus_sample(FINDER_CORPUS_SEED, FINDER_CORPUS_SIZE);
-    let corpus: Vec<&[u8]> = boards.iter().map(|b| b.as_slice()).collect();
+    let corpus: Vec<&[u8]> = boards.iter().map(|board| board.as_slice()).collect();
     println!(
         "  {} boards, {} bytes each (8x8 squares, chess alphabet)",
         corpus.len(),
         corpus[0].len()
     );
 
+    println!(
+        "  Leaderboard: top {} best, bottom {} worst",
+        FINDER_TOP_K, FINDER_BOTTOM_K
+    );
+
+    // Salt-array configuration is the same for both real modes so
+    // the report's `salt coll` column has the same meaning.
     let salt_config = SaltArrayConfig {
         salts: FINDER_SALTS.to_vec(),
     };
 
-    let meta_seed: u64 = if reproducible {
-        FINDER_FIXED_META_SEED
-    } else {
-        time_derived_meta_seed()
+    // Dispatch on the user's mode.
+    let report = match mode {
+        SectionSixMode::FullRandomSweep => {
+            // Meta-seed selection: fixed if --reproducible, otherwise
+            // derived from the system clock so each run explores a
+            // different region of the seed space.
+            let meta_seed: u64 = if reproducible {
+                FINDER_FIXED_META_SEED
+            } else {
+                time_derived_meta_seed()
+            };
+            println!(
+                "Full random sweep: {} seeds, meta_seed = 0x{:016X}{}",
+                FINDER_SEED_COUNT,
+                meta_seed,
+                if reproducible {
+                    " (reproducible)"
+                } else {
+                    " (time-derived; different each run)"
+                },
+            );
+            println!(
+                "This typically takes 10–30 seconds. Pass --reproducible to make\n\
+                 it deterministic; pass --auto to skip the menu in CI."
+            );
+            println!();
+
+            search_seeds(
+                &corpus,
+                Some(&salt_config),
+                SweepMode::PseudoRandom {
+                    meta_seed,
+                    count: FINDER_SEED_COUNT,
+                },
+                RankBy::BaseCollisions,
+                FINDER_TOP_K,
+                FINDER_BOTTOM_K,
+            )?
+        }
+
+        SectionSixMode::PerturbSpecificSeed(base_seed) => {
+            println!(
+                "Perturbation-only mode: base seed 0x{:016X}, 64 single-bit flips.",
+                base_seed
+            );
+            println!(
+                "Total seeds evaluated this run: 65 (base + 64 neighbors).\n\
+                 Typical runtime: well under one second."
+            );
+            println!();
+
+            perturb_seed_search(
+                base_seed,
+                &corpus,
+                Some(&salt_config),
+                RankBy::BaseCollisions,
+                FINDER_TOP_K,
+                FINDER_BOTTOM_K,
+            )?
+        }
+
+        // Already returned above; the compiler requires the arm.
+        SectionSixMode::Skip => unreachable!("Skip handled with early return"),
     };
 
-    println!(
-        "Searching {} seeds; meta_seed = 0x{:016X}{}",
-        FINDER_SEED_COUNT,
-        meta_seed,
-        if reproducible {
-            " (reproducible)"
-        } else {
-            " (time-derived)"
-        },
-    );
-    println!("This typically takes 10–30 seconds. The same run twice with");
-    println!("--reproducible will produce identical results; without the flag,");
-    println!("each run explores a different region of the seed space.");
-    println!();
-
-    let report = search_seeds(
-        &corpus,
-        Some(&salt_config),
-        SweepMode::PseudoRandom {
-            meta_seed,
-            count: FINDER_SEED_COUNT,
-        },
-        RankBy::BaseCollisions,
-        FINDER_TOP_K,
-    )?;
-
     print_and_save_search_report(&report)?;
-    println!();
-    println!("To use a chosen seed in production: copy its hex value from the");
-    println!("leaderboard above and place it where you currently use the");
-    println!("default GENERATED_TABLE seed (0x9E3779B97F4A7C15).");
-    println!();
-
     Ok(())
 }
 
@@ -483,13 +690,31 @@ fn demo_section_table_finder(reproducible: bool) -> Result<(), Error> {
 // CLI parsing
 // =============================================================================
 
-/// Parse the command line for the `--reproducible` flag.
+/// Test whether a given flag string appears anywhere in `argv`.
 ///
-/// Project-level note: deliberately minimal CLI parsing — no
-/// third-party crate, no subcommand engine, no positional args.
-/// Returns `true` if the flag is present anywhere in `argv`.
-fn parse_cli_reproducible_flag() -> bool {
-    env::args().any(|arg| arg == "--reproducible")
+/// # Project-Level Context
+///
+/// The demo binary supports two independent boolean flags:
+///   `--reproducible` — finder uses a fixed meta-seed, so two runs
+///                      produce identical results.
+///   `--auto`         — skip the interactive section-6 prompt and
+///                      go straight to a full random sweep. Intended
+///                      for non-interactive runs (CI, scripted
+///                      benchmarking, redirected stdin).
+///
+/// This helper exists so we can ask "is `--foo` present?" without
+/// pulling in a third-party CLI crate. No argument values or
+/// positional parsing is needed for this demo.
+///
+/// # Arguments
+///
+/// * `flag_name` — the flag to look for, including its leading `--`.
+///
+/// # Returns
+///
+/// `true` if any `argv` element equals `flag_name`, otherwise `false`.
+fn cli_flag_is_set(flag_name: &str) -> bool {
+    env::args().any(|argument| argument == flag_name)
 }
 
 // =============================================================================
@@ -503,7 +728,8 @@ fn parse_cli_reproducible_flag() -> bool {
 /// transcript. Any error from a hashing or finder call is propagated;
 /// the process exits non-zero on error rather than panicking.
 fn main() -> Result<(), Error> {
-    let reproducible = parse_cli_reproducible_flag();
+    let reproducible = cli_flag_is_set("--reproducible");
+    let auto_mode = cli_flag_is_set("--auto");
 
     println!();
     println!("################################################################");
@@ -518,6 +744,11 @@ fn main() -> Result<(), Error> {
     } else {
         println!("#   Tip: pass --reproducible to use a fixed finder meta-seed   #");
     }
+    if auto_mode {
+        println!("#   Flag detected: --auto (skip section-6 prompt)              #");
+    } else {
+        println!("#   Tip: pass --auto to skip the section-6 prompt              #");
+    }
     println!("#                                                              #");
     println!("################################################################");
     println!();
@@ -527,7 +758,10 @@ fn main() -> Result<(), Error> {
     demo_section_comparative_report();
     demo_section_seed_sweep();
     demo_section_full_reports();
-    demo_section_table_finder(reproducible)?;
+
+    // Ask the user what to do for section 6 (or auto-default).
+    let section_six_mode = prompt_for_section_six_mode(auto_mode)?;
+    demo_section_table_finder(reproducible, section_six_mode)?;
 
     println!("================================================================");
     println!(" Demo complete.");

@@ -14,6 +14,13 @@ such as:
 #### Note:
 - For uses where the salt does not need to be very unique, a u8 hash will work as well as u128 to make a different salted result
 
+#### Note:
+- For generating a preferred permutation table for a given \
+  use-case / data-scope, the 3rd phase results can sometimes
+  produce best results, though not every time.
+  E.g. out of 5-10 runs for a chess-set, the 'best' lowest base chi2
+  came from a 3rd-phase, though most third phases was not lowr for that metric.
+
 ## Contents
 
 - [What Pearson hashing is](#what-pearson-hashing-is)

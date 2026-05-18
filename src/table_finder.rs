@@ -1,4 +1,5 @@
 // src/table_finder.rs
+// (made with assistance from claude 4.7)
 
 //! # `table_finder` — Search for the best Pearson permutation table
 //!                     for a user-supplied corpus
@@ -62,9 +63,7 @@ use crate::pearson_hash_salt_array_rust::{
     GENERATED_TABLE, PEARSON_1990_TABLE, pearson_hash_base, pearson_hash_salt_array,
 };
 
-use crate::pearson_hash_tools::{
-    TableQualityReport, evaluate_table, generate_table_fisher_yates, is_valid_permutation_tools,
-};
+use crate::pearson_hash_tools::{TableQualityReport, evaluate_table, generate_table_fisher_yates};
 
 // =============================================================================
 // SECTION 1: Configuration types
@@ -86,7 +85,7 @@ pub const MAX_SALTS: usize = 8;
 /// User-visible ranking criterion. The selected criterion
 /// determines leaderboard order; all other metrics are computed
 /// and reported anyway so the user sees trade-offs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)] // Debug,
 pub enum RankBy {
     /// Total unordered colliding pairs for the base 8-bit Pearson
     /// hash on the user's corpus. Lower is better. Recommended
@@ -245,6 +244,13 @@ pub struct SearchReport {
     /// Result of phase 3 (perturbation refinement). One entry per
     /// surviving perturbed candidate, ranked the same way.
     pub perturbation_top_k: Vec<CorpusScoreReport>,
+    /// The worst-performing seeds from Phase 1, ranked by the same
+    /// metric as `top_k` but in descending order (worst first).
+    /// Structural metrics are attached (Phase 2) so the user can
+    /// inspect what a bad table looks like alongside the good ones.
+    /// Populated by `search_seeds` and `perturb_seed_search`; the
+    /// caller controls the count via the `bottom_k` parameter.
+    pub worst_k: Vec<CorpusScoreReport>,
     pub elapsed_seconds: f64,
 }
 
@@ -443,6 +449,7 @@ pub fn search_seeds(
     mode: SweepMode,
     rank_by: RankBy,
     top_k: usize,
+    bottom_k: usize,
 ) -> Result<SearchReport, Error> {
     // ---- Defensive checks ----
     if corpus.is_empty() {
@@ -480,6 +487,11 @@ pub fn search_seeds(
     // -------------------------------------------------------------
     let mut leaderboard: Vec<CorpusScoreReport> = Vec::with_capacity(top_k + 1);
 
+    // Worst-K board: same shape as `leaderboard`, but kept sorted
+    // in DESCENDING ranking_value order so the worst-ranking
+    // candidates are retained instead of the best.
+    let mut worst_board: Vec<CorpusScoreReport> = Vec::with_capacity(bottom_k + 1);
+
     let mut prng_state: u64 = match mode {
         SweepMode::PseudoRandom { meta_seed, .. } => meta_seed,
         SweepMode::Linear { .. } => 0, // unused
@@ -498,6 +510,20 @@ pub fn search_seeds(
         };
         score.seed = seed;
 
+        // Maintain a bottom-K (highest ranking_value = worst) list,
+        // mirror of the top-K logic but with the sort comparator
+        // arguments swapped. Clone here because the existing
+        // `leaderboard.push(score)` below takes ownership of `score`.
+        if bottom_k > 0 {
+            worst_board.push(score.clone());
+            if worst_board.len() > bottom_k {
+                worst_board.sort_by(|a, b| {
+                    cmp_ranking(b.ranking_value(rank_by), a.ranking_value(rank_by))
+                });
+                worst_board.truncate(bottom_k);
+            }
+        }
+
         // Maintain a top-K (lowest ranking_value) list.
         // For small K, simple insertion is fine.
         leaderboard.push(score);
@@ -511,6 +537,9 @@ pub fn search_seeds(
     // Final sort of phase-1 leaders.
     leaderboard.sort_by(|a, b| cmp_ranking(a.ranking_value(rank_by), b.ranking_value(rank_by)));
 
+    // Final sort of worst-K, descending (worst-first).
+    worst_board.sort_by(|a, b| cmp_ranking(b.ranking_value(rank_by), a.ranking_value(rank_by)));
+
     // -------------------------------------------------------------
     // PHASE 2 — full structural evaluation of top-K survivors.
     // -------------------------------------------------------------
@@ -518,6 +547,13 @@ pub fn search_seeds(
         let table = generate_table_fisher_yates(entry.seed);
         let structural = evaluate_table(&table);
         entry.structural = Some(structural);
+    }
+
+    // Same Phase-2 attachment for worst-K, so the report can show
+    // structural metrics of the worst performers alongside the best.
+    for entry in worst_board.iter_mut() {
+        let table = generate_table_fisher_yates(entry.seed);
+        entry.structural = Some(evaluate_table(&table));
     }
 
     // -------------------------------------------------------------
@@ -571,7 +607,209 @@ pub fn search_seeds(
         baseline_1990,
         baseline_generated,
         perturbation_top_k: perturbed_pool,
+        worst_k: worst_board,
         elapsed_seconds: elapsed,
+    })
+}
+
+/// Run a perturbation-only search against a single user-supplied seed.
+///
+/// # Project-Level Context
+///
+/// The full `search_seeds` workflow performs three phases:
+///   Phase 1 — score every candidate seed in a sweep (cheap),
+///   Phase 2 — attach structural metrics to the top-K survivors,
+///   Phase 3 — refine those survivors by flipping each of their 64
+///             seed-bits one at a time and re-scoring.
+///
+/// In normal use, a developer runs the full three-phase sweep, reads
+/// the leaderboard, and copies a promising seed out of the report.
+/// They often want to revisit that same seed later — perhaps after
+/// trying a different corpus, perhaps to look more carefully at its
+/// neighborhood — without paying for another 10,000-seed sweep.
+///
+/// This function exists for that workflow: given one hex seed, do
+/// only Phase 3 (the 64 single-bit-flip neighbors) plus a re-score
+/// of the original seed, attach structural metrics, and return a
+/// `SearchReport` that reuses the existing print/save pipeline.
+///
+/// # Output Shape
+///
+/// The returned `SearchReport` is laid out so that the existing
+/// `render_search_report` pretty-prints it correctly:
+///
+///   - `top_k`              has one entry  — the user-supplied seed.
+///   - `perturbation_top_k` has up to `top_k` entries — the best of
+///                          the 64 single-bit-flip neighbors, ranked
+///                          by `rank_by`.
+///   - `baseline_1990` and `baseline_generated` are populated as
+///                          usual for reference.
+///   - `seeds_evaluated` is exactly 65 (the seed itself + its 64
+///                          one-bit-flip neighbors).
+///   - `sweep_mode_description` carries a human-readable string
+///                          that distinguishes this from a sweep.
+///
+/// # Arguments
+///
+/// * `seed` — the 64-bit Fisher-Yates seed the user wants to refine.
+///   Any `u64` value is accepted; there is no requirement that it
+///   came from a previous sweep.
+/// * `corpus` — the user's representative input data. Must be
+///   non-empty; see also `score_table_on_corpus`.
+/// * `salt_config` — optional salt-array test configuration. If
+///   `None`, `salt coll` is reported as `-` in the leaderboard.
+/// * `rank_by` — which metric to sort the perturbed neighbors by
+///   (same semantics as `search_seeds`).
+/// * `top_k` — how many of the 64 neighbors to keep on the
+///   leaderboard. Must be ≥ 1.
+///
+/// # Returns
+///
+/// A populated `SearchReport`, suitable for passing directly to
+/// `print_and_save_search_report`.
+///
+/// # Errors
+///
+/// Returns `Err(std::io::Error)` with a `"TF:"` prefix on:
+///   - `"TF: empty corpus"` if `corpus.is_empty()`.
+///   - `"TF: zero top_k"`  if `top_k == 0`.
+///   - any error propagated from `score_table_on_corpus` for the
+///     baseline tables (e.g. invalid salt config).
+///
+/// Per-neighbor scoring failures (which should not occur in normal
+/// use) are silently skipped rather than aborting the whole run,
+/// matching the resilience posture of `search_seeds`.
+pub fn perturb_seed_search(
+    seed: u64,
+    corpus: &[&[u8]],
+    salt_config: Option<&SaltArrayConfig>,
+    rank_by: RankBy,
+    top_k: usize,
+    bottom_k: usize,
+) -> Result<SearchReport, Error> {
+    // ---- Defensive input checks (production-safe; no panic) ----
+    if corpus.is_empty() {
+        return Err(Error::new(ErrorKind::InvalidInput, "TF: empty corpus"));
+    }
+    if top_k == 0 {
+        return Err(Error::new(ErrorKind::InvalidInput, "TF: zero top_k"));
+    }
+
+    let start_time = Instant::now();
+
+    // Corpus length stats; identical to the bookkeeping in search_seeds
+    // so the report header reads the same regardless of which entry
+    // point produced the SearchReport.
+    let mut min_entry_length: usize = usize::MAX;
+    let mut max_entry_length: usize = 0;
+    for entry in corpus.iter() {
+        if entry.len() < min_entry_length {
+            min_entry_length = entry.len();
+        }
+        if entry.len() > max_entry_length {
+            max_entry_length = entry.len();
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Score the user-supplied "base" seed itself.
+    //
+    // It is placed in `top_k` (a single-element vec) so that the
+    // existing rendering code labels it as the Phase-1 entry and
+    // prints its detailed structural metrics block. Conceptually it
+    // is the "thing we are perturbing around", not a sweep winner.
+    // -----------------------------------------------------------------
+    let original_table: [u8; 256] = generate_table_fisher_yates(seed);
+    let mut original_score = score_table_on_corpus(&original_table, corpus, salt_config)?;
+    original_score.seed = seed;
+    original_score.structural = Some(evaluate_table(&original_table));
+
+    // -----------------------------------------------------------------
+    // Score the 64 single-bit-flip neighbors.
+    //
+    // This is exactly the same neighborhood `search_seeds` would
+    // generate in its Phase 3 for a single survivor seed. We attach
+    // the full structural metrics to each survivor so the detail
+    // block can render the cycle/displacement/correlation fields.
+    // -----------------------------------------------------------------
+    let mut perturbed_pool: Vec<CorpusScoreReport> = Vec::with_capacity(64);
+    for bit_position in 0..64u32 {
+        let flipped_seed: u64 = seed ^ (1u64 << bit_position);
+        let flipped_table: [u8; 256] = generate_table_fisher_yates(flipped_seed);
+
+        // Per-neighbor scoring failure is treated as "skip this
+        // neighbor" rather than aborting the whole run. In practice
+        // this branch is unreachable because we already validated
+        // the corpus and salt config above; the `continue` is a
+        // defensive belt-and-braces guard.
+        let mut neighbor_score = match score_table_on_corpus(&flipped_table, corpus, salt_config) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        neighbor_score.seed = flipped_seed;
+        neighbor_score.structural = Some(evaluate_table(&flipped_table));
+        perturbed_pool.push(neighbor_score);
+    }
+
+    // Rank and trim to top_k. Tied-rank ordering is whatever
+    // `partial_cmp` produces on the underlying f64; this is stable
+    // enough for a developer-facing leaderboard.
+    perturbed_pool.sort_by(|a, b| cmp_ranking(a.ranking_value(rank_by), b.ranking_value(rank_by)));
+
+    // Capture worst-K BEFORE the truncate below removes them.
+    // After the ascending sort above, the worst entries sit at the
+    // end of the vector, so we slice from the tail and reverse so
+    // the worst is first. Structural metrics were already attached
+    // to every neighbor during scoring, so no extra Phase-2 loop
+    // is needed for worst_pool.
+    let worst_pool: Vec<CorpusScoreReport> = if bottom_k == 0 || perturbed_pool.is_empty() {
+        Vec::new()
+    } else {
+        let pool_len: usize = perturbed_pool.len();
+        let take_count: usize = if bottom_k > pool_len {
+            pool_len
+        } else {
+            bottom_k
+        };
+        let mut tail: Vec<CorpusScoreReport> = perturbed_pool[pool_len - take_count..].to_vec();
+        tail.reverse(); // worst-first order
+        tail
+    };
+
+    perturbed_pool.truncate(top_k);
+
+    // -----------------------------------------------------------------
+    // Baselines, computed identically to `search_seeds` so the
+    // "Baselines" row of the report has the same meaning regardless
+    // of which entry point produced the SearchReport.
+    // -----------------------------------------------------------------
+    let mut baseline_1990 = score_table_on_corpus(&PEARSON_1990_TABLE, corpus, salt_config)?;
+    baseline_1990.seed = 0; // sentinel; the renderer replaces this with a label
+    baseline_1990.structural = Some(evaluate_table(&PEARSON_1990_TABLE));
+
+    let mut baseline_generated = score_table_on_corpus(&GENERATED_TABLE, corpus, salt_config)?;
+    baseline_generated.seed = 0;
+    baseline_generated.structural = Some(evaluate_table(&GENERATED_TABLE));
+
+    let elapsed_seconds = start_time.elapsed().as_secs_f64();
+
+    Ok(SearchReport {
+        corpus_size: corpus.len(),
+        corpus_entry_lengths_min: min_entry_length,
+        corpus_entry_lengths_max: max_entry_length,
+        seeds_evaluated: 65, // base seed + 64 single-bit flips
+        sweep_mode_description: format!(
+            "Perturbation-only: base seed 0x{:016X}, 64 single-bit flips",
+            seed
+        ),
+        rank_by_description: rank_by.description(),
+        salt_array_used: salt_config.map(|c| c.salts.len()),
+        top_k: vec![original_score],
+        baseline_1990,
+        baseline_generated,
+        perturbation_top_k: perturbed_pool,
+        worst_k: worst_pool,
+        elapsed_seconds,
     })
 }
 
@@ -660,13 +898,26 @@ pub fn build_chess_corpus_sample(seed: u64, count: usize) -> Vec<[u8; 64]> {
 // SECTION 8: Printing and file output
 // =============================================================================
 
-/// Format the current local-ish time as `YYYYmmdd_HHMMSS`.
+/// Format the current UTC time as `YYYYmmdd_HHMMSS` for use as a
+/// filename suffix.
 ///
-/// Project-level note: uses UTC (not local time) to avoid any
-/// dependency on platform timezone APIs and to keep filenames
-/// deterministic across machines. The user is expected to read
-/// these filenames as run-ordering markers, not as wall-clock
-/// records.
+/// # Project-Level Context
+///
+/// Saved leaderboard files are named `perm_test_{suffix}.txt`. The
+/// suffix is purely an ordering marker for a developer eyeballing
+/// the directory listing, not a precise wall-clock record:
+///
+///   - UTC is used (not local time) so the result has no dependency
+///     on platform timezone APIs and is consistent across machines.
+///   - No leap-second handling; off by ≤1 second is fine for a
+///     run-ordering marker.
+///   - The 15-character fixed-width format sorts correctly as a
+///     plain string (lexicographic order == chronological order).
+///
+/// # Returns
+///
+/// A 15-character heap-allocated `String`: 8 digits of date, an
+/// underscore, then 6 digits of time, e.g. `20251115_143027`.
 fn timestamp_filename_suffix() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -674,7 +925,6 @@ fn timestamp_filename_suffix() -> String {
     let secs: u64 = now.as_secs();
 
     // Convert seconds-since-epoch to Y/M/D/H/M/S (UTC).
-    // Simple algorithm; no leap-second handling.
     let s: u64 = secs % 60;
     let m: u64 = (secs / 60) % 60;
     let h: u64 = (secs / 3600) % 24;
@@ -695,24 +945,447 @@ fn timestamp_filename_suffix() -> String {
     format!("{:04}{:02}{:02}_{:02}{:02}{:02}", year, mo, d, h, m, s)
 }
 
-/// Render a `CorpusScoreReport` as a single line for the leaderboard.
-fn format_score_line(rank: usize, report: &CorpusScoreReport) -> String {
-    let salt_field: String = if report.salt_array_collisions == usize::MAX {
-        format!("{:>9}", "—")
-    } else {
-        format!("{:>9}", report.salt_array_collisions)
+/// Format the full structural detail block for one survivor.
+///
+/// # Project-Level Context
+///
+/// The leaderboard table can only fit two of the six structural
+/// metrics documented in `pearson_hash_tools.rs`. The remaining four
+/// — cycle structure, displacement, sequential correlation, and
+/// empirical-collisions-on-the-tools'-reference-corpus — are
+/// nevertheless computed for every Phase-2 survivor and stored in
+/// the `structural` field of the `CorpusScoreReport`. This function
+/// surfaces them as a multi-line indented block underneath each
+/// phase of the leaderboard, so the reader has the full picture
+/// without making the main table unreadable.
+///
+/// The two metrics that ARE in the main table (XOR-worst and
+/// fixed-point count) are repeated here for completeness, with
+/// added context (e.g. the `d` value at which XOR-worst was hit).
+///
+/// # Note on Field Names
+///
+/// `TableQualityReport` stores cycle statistics as flat fields
+/// (`one_cycle_count`, `two_cycle_count`, `longest_cycle`,
+/// `cycle_lengths`) rather than nested under a `cycles` sub-struct.
+/// "Total cycle count" is derived here as `cycle_lengths.len()`,
+/// which is guaranteed correct because the cycle decomposition of
+/// a permutation puts each element into exactly one cycle, so the
+/// number of entries in `cycle_lengths` IS the number of cycles.
+///
+/// # Important Caveat About `empirical coll.`
+///
+/// The `empirical_collisions` field on `TableQualityReport` is
+/// counted against the *tools' built-in fixed reference corpus*,
+/// not against the user's search corpus. The two should not be
+/// conflated. The leaderboard's `base coll` and `salt coll` columns
+/// are the user-corpus measurements; `empirical coll.` here is the
+/// reference-corpus measurement. The block calls this out in plain
+/// text so a reader cannot accidentally confuse them.
+///
+/// # Arguments
+///
+/// * `rank` — same rank used in the corresponding leaderboard line,
+///   for cross-referencing.
+/// * `report` — one survivor; if its `structural` field is `None`
+///   this function returns an empty string (the survivor has not
+///   been through Phase 2).
+///
+/// # Returns
+///
+/// A heap-allocated multi-line `String`, ending in a newline. Empty
+/// if no structural report is available.
+fn format_structural_detail_block(rank: usize, report: &CorpusScoreReport) -> String {
+    let structural = match &report.structural {
+        Some(s) => s,
+        None => return String::new(),
     };
 
-    let (xor_worst, fixed_pts): (String, String) = match &report.structural {
+    let mut out = String::with_capacity(512);
+
+    out.push_str(&format!("  #{:<2} seed = 0x{:016X}\n", rank, report.seed));
+
+    // Cycle structure (flat fields on TableQualityReport).
+    out.push_str(&format!(
+        "      fixed points:        {}    one-cycles: {}    two-cycles: {}\n",
+        structural.fixed_point_count, structural.one_cycle_count, structural.two_cycle_count,
+    ));
+    // `cycle_lengths.len()` is the number of disjoint cycles in the
+    // permutation's cycle decomposition — see doc note above.
+    out.push_str(&format!(
+        "      longest cycle:       {}    total cycles: {}\n",
+        structural.longest_cycle,
+        structural.cycle_lengths.len(),
+    ));
+
+    // Displacement sub-struct (verified field names: min_/max_/mean_displacement).
+    out.push_str(&format!(
+        "      displacement:        min {}  max {}  mean {:.3}\n",
+        structural.displacement.min_displacement,
+        structural.displacement.max_displacement,
+        structural.displacement.mean_displacement,
+    ));
+
+    out.push_str(&format!(
+        "      seq. correlation:    |r| = {:.6}\n",
+        structural.sequential_correlation_abs,
+    ));
+
+    // XOR uniformity sub-struct: worst_chi_square, worst_difference, mean_chi_square.
+    out.push_str(&format!(
+        "      XOR worst chi^2:     {:.2}   (at d = 0x{:02X})\n",
+        structural.xor_uniformity.worst_chi_square, structural.xor_uniformity.worst_difference,
+    ));
+    out.push_str(&format!(
+        "      XOR mean  chi^2:     {:.2}\n",
+        structural.xor_uniformity.mean_chi_square,
+    ));
+
+    // Empirical collisions: on the tools' built-in reference corpus,
+    // NOT on the search corpus. Flagged in plain text to prevent
+    // confusion with the leaderboard's `base coll` / `salt coll`.
+    out.push_str(&format!(
+        "      empirical coll.:     {}   (on the tools' built-in fixed\n",
+        structural.empirical_collisions,
+    ));
+    out.push_str("                            reference corpus — NOT on your\n");
+    out.push_str("                            search corpus; see 'base coll' /\n");
+    out.push_str("                            'salt coll' for your-corpus counts)\n");
+
+    out
+}
+
+// =============================================================================
+// SECTION 8.A: Wide-leaderboard column widths (single source of truth)
+// =============================================================================
+//
+// All four leaderboard rows — direction-marker row, header row, score line,
+// and baseline line — pass through the same nineteen `{:>W}` width slots.
+// To prevent the four from drifting apart over time, the widths live here
+// once, as named constants, and every formatter below references the same
+// constants. If you add or remove a column, you must:
+//   1. add/remove a constant in this block,
+//   2. add/remove one slot in `format_direction_row`,
+//   3. add/remove one slot in `format_header_row`,
+//   4. add/remove one slot in `format_score_line`,
+//   5. extend the legend text in `format_legend_block`.
+// There is no way around step 5; the legend is prose, not data.
+
+const LB_W_RK: usize = 4; // rank
+const LB_W_SEED: usize = 18; // "0x" + 16 hex digits
+const LB_W_BASE_COLL: usize = 10; // corpus base-hash colliding pairs
+const LB_W_BASE_CHI2: usize = 11; // corpus base-hash chi-square
+const LB_W_MAX: usize = 5; // worst base-hash bucket occupancy
+const LB_W_EMPTY: usize = 5; // empty base-hash buckets
+const LB_W_SALT_COLL: usize = 10; // corpus salt-array colliding pairs
+const LB_W_FIX: usize = 4; // fixed_point_count
+const LB_W_1CYC: usize = 5; // one_cycle_count
+const LB_W_2CYC: usize = 5; // two_cycle_count
+const LB_W_LONG: usize = 5; // longest_cycle
+const LB_W_TOT: usize = 4; // cycle_lengths.len()
+const LB_W_DMIN: usize = 5; // displacement.min_displacement
+const LB_W_DMAX: usize = 5; // displacement.max_displacement
+const LB_W_DMEAN: usize = 8; // displacement.mean_displacement (f64 .2)
+const LB_W_R: usize = 9; // sequential_correlation_abs    (f64 .5)
+const LB_W_XWC: usize = 9; // xor_uniformity.worst_chi_square (f64 .2)
+const LB_W_XMC: usize = 9; // xor_uniformity.mean_chi_square  (f64 .2)
+const LB_W_REFCOLL: usize = 9; // empirical_collisions
+
+// =============================================================================
+// SECTION 8.B: Direction-marker row
+// =============================================================================
+
+/// Build the single "direction marker" line printed directly above the
+/// leaderboard's column-header line.
+///
+/// # Project-Level Context
+///
+/// Each leaderboard column has a fixed "what counts as better" interpretation
+/// — lower-is-better for collision counts, higher-is-better for displacement
+/// mean, closer-to-zero for the sequential correlation, and so on. Printing
+/// that interpretation once, aligned over the column headers, lets the
+/// reader interpret the numbers below without consulting the prose legend
+/// for every column.
+///
+/// # Marker Glyphs
+///
+///   `↓`   lower is better
+///   `↑`   higher is better
+///   `→0`  closer to zero is better
+///   `n/a` informational; no preferred direction
+///
+/// # Returns
+///
+/// A heap-allocated `String`, one line, no trailing newline.
+fn format_direction_row() -> String {
+    format!(
+        "  {:>w01$}   {:>w02$}   {:>w03$}   {:>w04$}   {:>w05$}   {:>w06$}   \
+           {:>w07$}   {:>w08$}   {:>w09$}   {:>w10$}   {:>w11$}   {:>w12$}   \
+           {:>w13$}   {:>w14$}   {:>w15$}   {:>w16$}   {:>w17$}   {:>w18$}   \
+           {:>w19$}",
+        "n/a",
+        "n/a",       // rk, seed   (identifiers, not metrics)
+        "\u{2193}",  // base coll  ↓
+        "\u{2193}",  // base chi²  ↓
+        "\u{2193}",  // max        ↓
+        "\u{2193}",  // empty      ↓
+        "\u{2193}",  // salt coll  ↓
+        "\u{2193}",  // fix        ↓
+        "\u{2193}",  // 1cyc       ↓
+        "\u{2193}",  // 2cyc       ↓
+        "\u{2191}",  // long       ↑
+        "\u{2193}",  // tot        ↓
+        "n/a",       // dmin       informational
+        "\u{2191}",  // dmax       ↑
+        "\u{2191}",  // dmean      ↑
+        "\u{2192}0", // |r|        →0
+        "\u{2193}",  // XwC        ↓
+        "\u{2193}",  // XmC        ↓
+        "\u{2193}",  // ref-coll   ↓
+        w01 = LB_W_RK,
+        w02 = LB_W_SEED,
+        w03 = LB_W_BASE_COLL,
+        w04 = LB_W_BASE_CHI2,
+        w05 = LB_W_MAX,
+        w06 = LB_W_EMPTY,
+        w07 = LB_W_SALT_COLL,
+        w08 = LB_W_FIX,
+        w09 = LB_W_1CYC,
+        w10 = LB_W_2CYC,
+        w11 = LB_W_LONG,
+        w12 = LB_W_TOT,
+        w13 = LB_W_DMIN,
+        w14 = LB_W_DMAX,
+        w15 = LB_W_DMEAN,
+        w16 = LB_W_R,
+        w17 = LB_W_XWC,
+        w18 = LB_W_XMC,
+        w19 = LB_W_REFCOLL,
+    )
+}
+
+// =============================================================================
+// SECTION 8.C: Column-header row
+// =============================================================================
+
+/// Build the leaderboard column-header line.
+///
+/// # Project-Level Context
+///
+/// Printed immediately under the direction-marker row, immediately above
+/// the horizontal divider, in both Phase 1 and Phase 3 sections. The
+/// header *abbreviations* are deliberately short because the prose legend
+/// (printed once per phase) maps each abbreviation to its long description.
+///
+/// # Returns
+///
+/// A heap-allocated `String`, one line, no trailing newline.
+fn format_header_row() -> String {
+    format!(
+        "  {:>w01$}   {:>w02$}   {:>w03$}   {:>w04$}   {:>w05$}   {:>w06$}   \
+           {:>w07$}   {:>w08$}   {:>w09$}   {:>w10$}   {:>w11$}   {:>w12$}   \
+           {:>w13$}   {:>w14$}   {:>w15$}   {:>w16$}   {:>w17$}   {:>w18$}   \
+           {:>w19$}",
+        "rk",
+        "seed (hex)",
+        "base coll",
+        "base chi\u{00B2}", // "chi²"
+        "max",
+        "empty",
+        "salt coll",
+        "fix",
+        "1cyc",
+        "2cyc",
+        "long",
+        "tot",
+        "dmin",
+        "dmax",
+        "dmean",
+        "|r|",
+        "XwC",
+        "XmC",
+        "ref-coll",
+        w01 = LB_W_RK,
+        w02 = LB_W_SEED,
+        w03 = LB_W_BASE_COLL,
+        w04 = LB_W_BASE_CHI2,
+        w05 = LB_W_MAX,
+        w06 = LB_W_EMPTY,
+        w07 = LB_W_SALT_COLL,
+        w08 = LB_W_FIX,
+        w09 = LB_W_1CYC,
+        w10 = LB_W_2CYC,
+        w11 = LB_W_LONG,
+        w12 = LB_W_TOT,
+        w13 = LB_W_DMIN,
+        w14 = LB_W_DMAX,
+        w15 = LB_W_DMEAN,
+        w16 = LB_W_R,
+        w17 = LB_W_XWC,
+        w18 = LB_W_XMC,
+        w19 = LB_W_REFCOLL,
+    )
+}
+
+// =============================================================================
+// SECTION 8.D: Prose legend block
+// =============================================================================
+
+/// Build the multi-line prose legend explaining every leaderboard column
+/// and every direction-marker glyph.
+///
+/// # Project-Level Context
+///
+/// Printed before Phase 1 and again before Phase 3. The legend is the
+/// single place where each column abbreviation is mapped to its full
+/// description; the column-header row only carries the abbreviations.
+/// Repeating the legend at Phase 3 lets a reader scroll directly to the
+/// perturbation results without losing context.
+///
+/// # Returns
+///
+/// A heap-allocated `String`, multi-line, ending in a newline.
+fn format_legend_block() -> String {
+    let mut out = String::with_capacity(2048);
+
+    out.push_str("Direction markers in the row above the column headers:\n");
+    out.push_str("  \u{2193}     lower is better\n");
+    out.push_str("  \u{2191}     higher is better\n");
+    out.push_str("  \u{2192}0    closer to zero is better\n");
+    out.push_str("  n/a   informational; no preferred direction\n");
+    out.push('\n');
+
+    out.push_str("Leaderboard columns:\n");
+    out.push_str("  rk         leaderboard rank within this phase (1 = best by ranked metric)\n");
+    out.push_str("  seed       64-bit Fisher-Yates seed (hex)\n");
+    out.push_str("  base coll  unordered colliding pairs on YOUR corpus, base 8-bit hash\n");
+    out.push_str("  base chi\u{00B2}  chi-square of base-hash bucket histogram vs uniform\n");
+    out.push_str("  max        worst-case base-hash bucket occupancy on YOUR corpus\n");
+    out.push_str("  empty      number of empty base-hash buckets (out of 256), YOUR corpus\n");
+    out.push_str("  salt coll  unordered colliding pairs on the composite [u8; N] salt-array\n");
+    out.push_str("             key on YOUR corpus ('-' if salt-array test was disabled)\n");
+    out.push_str("  fix        fixed-point count: positions i where T[i] == i\n");
+    out.push_str("  1cyc       count of one-cycles (== fix; both listed for completeness)\n");
+    out.push_str("  2cyc       count of two-cycles (transpositions)\n");
+    out.push_str("  long       longest cycle in the permutation's cycle decomposition\n");
+    out.push_str("  tot        total number of disjoint cycles in the decomposition\n");
+    out.push_str("  dmin       displacement min:  min |T[i] - i|  (informational; 0 normal)\n");
+    out.push_str("  dmax       displacement max:  max |T[i] - i|\n");
+    out.push_str("  dmean      displacement mean: mean |T[i] - i|\n");
+    out.push_str("  |r|        |Pearson correlation of T[i] vs T[i+1]| over 0..255\n");
+    out.push_str("  XwC        *** primary structural metric ***\n");
+    out.push_str(
+        "             XOR-worst chi\u{00B2}: worst-case chi-square over all 255 nonzero\n",
+    );
+    out.push_str("             XOR differences d of the histogram { T[i] XOR T[i XOR d] };\n");
+    out.push_str("             governs the avalanche behavior of the Pearson hash\n");
+    out.push_str("  XmC        XOR-mean chi\u{00B2}: mean of the same chi-square over all 255 d\n");
+    out.push_str("  ref-coll   empirical collisions on the TOOLS' built-in fixed reference\n");
+    out.push_str("             corpus (NOT your search corpus; high variance — use the\n");
+    out.push_str("             'base coll' and 'salt coll' columns for your-corpus signal)\n");
+    out.push('\n');
+
+    out
+}
+
+// =============================================================================
+// SECTION 8.E: One leaderboard row
+// =============================================================================
+
+/// Format one `CorpusScoreReport` as a single leaderboard line.
+///
+/// # Project-Level Context
+///
+/// The leaderboard table is wide on purpose. It carries all four corpus
+/// metrics, the salt-array corpus metric, and all twelve structural
+/// metrics from `pearson_hash_tools` side-by-side, so the user can scan
+/// the rank order and the trade-offs together. The per-survivor
+/// "Detailed structural metrics" block under each phase covers the same
+/// values plus the few additional context items (e.g. the `d` at which
+/// `XwC` was hit) that don't ride in the table.
+///
+/// # Column Widths
+///
+/// All widths come from the named constants `LB_W_*` defined at the top
+/// of SECTION 8. The direction-marker row, the column-header row, the
+/// score line, and the baseline line all use those same constants; do
+/// not introduce literal widths here.
+///
+/// # Special Cases
+///
+/// * `salt_array_collisions == usize::MAX` renders as `-` (test disabled).
+/// * `structural.is_none()` renders every structural column as `-`. In
+///   the current code paths this cannot happen (all leaderboard entries
+///   go through Phase 2), but the contract still allows it.
+///
+/// # Arguments
+///
+/// * `rank` — printed in the leftmost column. The caller controls
+///   ranking semantics; `0` is used for baselines and the renderer
+///   later rewrites the seed cell into a `[1990 TABLE]` / `[GENERATED
+///   TABLE]` label.
+/// * `report` — one survivor's metrics.
+///
+/// # Returns
+///
+/// A heap-allocated `String`, one line, no trailing newline.
+fn format_score_line(rank: usize, report: &CorpusScoreReport) -> String {
+    // Salt-array column: sentinel -> dash, real number -> right-aligned.
+    let salt_field: String = if report.salt_array_collisions == usize::MAX {
+        format!("{:>w$}", "-", w = LB_W_SALT_COLL)
+    } else {
+        format!("{:>w$}", report.salt_array_collisions, w = LB_W_SALT_COLL)
+    };
+
+    // All twelve structural columns. Built as one tuple so the
+    // "present" branch and the "absent" branch stay symmetric.
+    let (fix_s, c1_s, c2_s, long_s, tot_s, dmin_s, dmax_s, dmean_s, r_s, xwc_s, xmc_s, ref_s): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = match &report.structural {
         Some(s) => (
-            format!("{:>10.2}", s.xor_uniformity.worst_chi_square),
-            format!("{:>4}", s.fixed_point_count),
+            format!("{:>w$}", s.fixed_point_count, w = LB_W_FIX),
+            format!("{:>w$}", s.one_cycle_count, w = LB_W_1CYC),
+            format!("{:>w$}", s.two_cycle_count, w = LB_W_2CYC),
+            format!("{:>w$}", s.longest_cycle, w = LB_W_LONG),
+            format!("{:>w$}", s.cycle_lengths.len(), w = LB_W_TOT),
+            format!("{:>w$}", s.displacement.min_displacement, w = LB_W_DMIN),
+            format!("{:>w$}", s.displacement.max_displacement, w = LB_W_DMAX),
+            format!("{:>w$.2}", s.displacement.mean_displacement, w = LB_W_DMEAN),
+            format!("{:>w$.5}", s.sequential_correlation_abs, w = LB_W_R),
+            format!("{:>w$.2}", s.xor_uniformity.worst_chi_square, w = LB_W_XWC),
+            format!("{:>w$.2}", s.xor_uniformity.mean_chi_square, w = LB_W_XMC),
+            format!("{:>w$}", s.empirical_collisions, w = LB_W_REFCOLL),
         ),
-        None => (format!("{:>10}", "—"), format!("{:>4}", "—")),
+        None => (
+            format!("{:>w$}", "-", w = LB_W_FIX),
+            format!("{:>w$}", "-", w = LB_W_1CYC),
+            format!("{:>w$}", "-", w = LB_W_2CYC),
+            format!("{:>w$}", "-", w = LB_W_LONG),
+            format!("{:>w$}", "-", w = LB_W_TOT),
+            format!("{:>w$}", "-", w = LB_W_DMIN),
+            format!("{:>w$}", "-", w = LB_W_DMAX),
+            format!("{:>w$}", "-", w = LB_W_DMEAN),
+            format!("{:>w$}", "-", w = LB_W_R),
+            format!("{:>w$}", "-", w = LB_W_XWC),
+            format!("{:>w$}", "-", w = LB_W_XMC),
+            format!("{:>w$}", "-", w = LB_W_REFCOLL),
+        ),
     };
 
     format!(
-        "  {:>3}   0x{:016X}   {:>9}   {:>10.2}   {:>4}   {:>4}   {}   {}   {}",
+        "  {:>w01$}   0x{:016X}   {:>w03$}   {:>w04$.2}   {:>w05$}   {:>w06$}   {}   \
+           {}   {}   {}   {}   {}   {}   {}   {}   {}   {}   {}   {}",
         rank,
         report.seed,
         report.base_collisions,
@@ -720,18 +1393,74 @@ fn format_score_line(rank: usize, report: &CorpusScoreReport) -> String {
         report.base_max_bucket,
         report.base_empty_buckets,
         salt_field,
-        xor_worst,
-        fixed_pts,
+        fix_s,
+        c1_s,
+        c2_s,
+        long_s,
+        tot_s,
+        dmin_s,
+        dmax_s,
+        dmean_s,
+        r_s,
+        xwc_s,
+        xmc_s,
+        ref_s,
+        w01 = LB_W_RK,
+        w03 = LB_W_BASE_COLL,
+        w04 = LB_W_BASE_CHI2,
+        w05 = LB_W_MAX,
+        w06 = LB_W_EMPTY,
     )
 }
 
-/// Build the full report text (used by both stdout and file
-/// output, so the two are guaranteed identical).
-fn render_search_report(report: &SearchReport) -> String {
-    let mut out = String::with_capacity(8192);
+// =============================================================================
+// SECTION 8.F: Whole report
+// =============================================================================
 
+/// Build the full report text.
+///
+/// # Project-Level Context
+///
+/// This function is the single source of truth for the rendered
+/// report text. `print_and_save_search_report` calls it once, then
+/// both writes the result to stdout and saves it to a timestamped
+/// `.txt` file. That guarantees the on-disk file and the terminal
+/// transcript are byte-identical, which matters when a developer
+/// goes back to read a saved file weeks later and wants to compare
+/// it to a fresh terminal run.
+///
+/// # Section Layout
+///
+/// Sections are printed in this order:
+///   1. Run-metadata header (corpus, sweep, ranking, elapsed).
+///   2. Column legend, placed BEFORE the table so the reader has
+///      the key in front of them while reading the numbers.
+///   3. Column header line + horizontal divider.
+///   4. Phase-1 leaderboard rows.
+///   5. Phase-1 structural-detail blocks.
+///   6. Phase-3 leaderboard rows.
+///   7. Phase-3 structural-detail blocks.
+///   8. Baseline rows (1990 table, default GENERATED_TABLE).
+///   9. "How to use a chosen seed" footer.
+///
+/// # Why the Legend Is Above the Table
+///
+/// In the previous version of this report, the legend was at the
+/// bottom; readers reported needing to scroll back and forth to map
+/// column headings to meanings. Placing it above the table is a
+/// readability win, at the cost of a slightly taller report.
+///
+/// # Heap Usage
+///
+/// This is tools / demo code. `String` and `format!` are used freely.
+/// The production hashing functions called from earlier phases do
+/// not allocate; only this rendering layer does.
+fn render_search_report(report: &SearchReport) -> String {
+    let mut out = String::with_capacity(32_768);
+
+    // 1. Run-metadata header.
     out.push_str("================================================================\n");
-    out.push_str(" Pearson permutation table search\n");
+    out.push_str(" Pearson permutation table search — results report\n");
     out.push_str("================================================================\n");
     out.push_str(&format!(
         "Corpus size:        {} entries\n",
@@ -745,6 +1474,7 @@ fn render_search_report(report: &SearchReport) -> String {
         "Sweep:              {}\n",
         report.sweep_mode_description
     ));
+    out.push_str(&format!("Seeds evaluated:    {}\n", report.seeds_evaluated));
     out.push_str(&format!(
         "Ranked by:          {}\n",
         report.rank_by_description
@@ -762,45 +1492,103 @@ fn render_search_report(report: &SearchReport) -> String {
     ));
     out.push('\n');
 
-    // Column header
-    let header = format!(
-        "  {:>3}   {:>18}   {:>9}   {:>10}   {:>4}   {:>4}   {:>9}   {:>10}   {:>4}",
-        "rk",
-        "seed (hex)",
-        "base coll",
-        "base chi2",
-        "max",
-        "empty",
-        "salt coll",
-        "XOR worst",
-        "fix",
-    );
-    out.push_str(&header);
+    // Reusable strings; cheap to clone but easier to read if we build them once.
+    let legend = format_legend_block();
+    let dir_row = format_direction_row();
+    let hdr_row = format_header_row();
+    let divider = "-".repeat(hdr_row.len());
+
+    // 2. Legend + direction row + header row + divider, above Phase 1.
+    out.push_str(&legend);
+    out.push_str(&dir_row);
     out.push('\n');
-    out.push_str(&"-".repeat(header.len()));
+    out.push_str(&hdr_row);
+    out.push('\n');
+    out.push_str(&divider);
     out.push('\n');
 
-    // Phase 1 top-K leaders.
-    out.push_str("Phase 1 — best seeds from random sweep:\n");
+    // 3. Phase 1 rows.
+    out.push_str("Phase 1 — best seeds from sweep (or user-supplied base seed):\n");
     for (i, r) in report.top_k.iter().enumerate() {
         out.push_str(&format_score_line(i + 1, r));
         out.push('\n');
     }
     out.push('\n');
 
-    // Phase 3 perturbation results.
-    out.push_str("Phase 3 — best after single-bit-flip perturbation of phase-1 leaders:\n");
+    // 4. Phase 1 per-survivor detail blocks.
+    out.push_str("Detailed structural metrics for Phase 1 entries:\n");
+    for (i, r) in report.top_k.iter().enumerate() {
+        out.push_str(&format_structural_detail_block(i + 1, r));
+    }
+    out.push('\n');
+
+    // Worst-K leaderboard rows + detail blocks, for contrast against
+    // the best-K above. Section is omitted entirely if `worst_k` is
+    // empty (i.e. the caller passed bottom_k = 0).
+    if !report.worst_k.is_empty() {
+        out.push_str(&dir_row);
+        out.push('\n');
+        out.push_str(&hdr_row);
+        out.push('\n');
+        out.push_str(&divider);
+        out.push('\n');
+
+        out.push_str(&format!(
+            "Phase 1 \u{2014} WORST {} seeds from sweep (for contrast):\n",
+            report.worst_k.len()
+        ));
+        for (i, r) in report.worst_k.iter().enumerate() {
+            out.push_str(&format_score_line(i + 1, r));
+            out.push('\n');
+        }
+        out.push('\n');
+
+        out.push_str("Detailed structural metrics for Phase 1 WORST entries:\n");
+        for (i, r) in report.worst_k.iter().enumerate() {
+            out.push_str(&format_structural_detail_block(i + 1, r));
+        }
+        out.push('\n');
+    }
+
+    // 5. Full legend block + direction row + header row + divider, REPEATED
+    //    above Phase 3 so the phase is readable in isolation.
+    out.push_str(&legend);
+    out.push_str(&dir_row);
+    out.push('\n');
+    out.push_str(&hdr_row);
+    out.push('\n');
+    out.push_str(&divider);
+    out.push('\n');
+
+    // 6. Phase 3 rows.
+    out.push_str("Phase 3 — best after single-bit-flip perturbation:\n");
     for (i, r) in report.perturbation_top_k.iter().enumerate() {
         out.push_str(&format_score_line(i + 1, r));
         out.push('\n');
     }
     out.push('\n');
 
-    // Baselines, formatted with their own (synthetic) ranks.
-    out.push_str("Baselines (for reference):\n");
+    // 7. Phase 3 per-survivor detail blocks.
+    out.push_str("Detailed structural metrics for Phase 3 entries:\n");
+    for (i, r) in report.perturbation_top_k.iter().enumerate() {
+        out.push_str(&format_structural_detail_block(i + 1, r));
+    }
+    out.push('\n');
+
+    // 8. Baselines, rendered with the same wide row format so every
+    //    numeric column lines up with the leaderboard above. The seed
+    //    cell sentinel `0x0000000000000000` is rewritten to a bracketed
+    //    label after `format_score_line` returns, so the cell width
+    //    matches `"0x" + 16 hex digits` = 18 chars.
+    out.push_str(&dir_row);
+    out.push('\n');
+    out.push_str(&hdr_row);
+    out.push('\n');
+    out.push_str(&divider);
+    out.push('\n');
+    out.push_str("Baselines (for reference, NOT search results):\n");
+
     let mut baseline_1990_line = format_score_line(0, &report.baseline_1990);
-    // Replace the "0x0000...0000" seed printout for baselines with
-    // a label.
     baseline_1990_line = baseline_1990_line.replacen("0x0000000000000000", "[1990 TABLE      ]", 1);
     out.push_str(&baseline_1990_line);
     out.push('\n');
@@ -811,19 +1599,15 @@ fn render_search_report(report: &SearchReport) -> String {
     out.push('\n');
     out.push('\n');
 
-    out.push_str("Column legend:\n");
-    out.push_str("  base coll  = unordered colliding pairs for the 8-bit Pearson hash\n");
-    out.push_str("  base chi2  = chi-square of base-hash bucket histogram vs. uniform\n");
-    out.push_str("  max        = worst-case bucket occupancy (base hash)\n");
-    out.push_str("  empty      = number of empty buckets (base hash)\n");
-    out.push_str("  salt coll  = colliding pairs for the salt-array hash (— if disabled)\n");
-    out.push_str("  XOR worst  = structural metric: worst-case chi-square over XOR diffs\n");
-    out.push_str("  fix        = structural metric: fixed-point count\n");
+    // 9. Footer.
+    out.push_str("To use a chosen seed in production code:\n");
+    out.push_str("    const MY_SEED:  u64        = 0x????????????????;\n");
+    out.push_str("    const MY_TABLE: [u8; 256]  =\n");
+    out.push_str("        generate_table_fisher_yates_const(MY_SEED);\n");
     out.push('\n');
-    out.push_str("To use a chosen seed in production:\n");
-    out.push_str("  const MY_SEED: u64 = 0x????????????????;\n");
-    out.push_str("  const MY_TABLE: [u8; 256] =\n");
-    out.push_str("      generate_table_fisher_yates_const(MY_SEED);\n");
+    out.push_str("To refine a promising seed without re-running the full sweep,\n");
+    out.push_str("re-run this binary and choose option [2] 'Perturb a specific\n");
+    out.push_str("seed' at the section-6 prompt, pasting the hex seed in.\n");
     out.push('\n');
 
     out
@@ -862,8 +1646,14 @@ pub fn print_and_save_search_report(report: &SearchReport) -> Result<PathBuf, Er
 // =============================================================================
 
 #[cfg(test)]
-mod tests {
+mod table_finder_tests {
     use super::*;
+
+    // Test-only import: `is_valid_permutation_tools` is referenced
+    // only by `test_imported_tables_are_valid_permutations` below,
+    // so we scope it to the test module to avoid an "unused import"
+    // warning in non-test builds.
+    use crate::pearson_hash_tools::is_valid_permutation_tools;
 
     /// Build a small known corpus for deterministic tests.
     fn tiny_corpus() -> Vec<Vec<u8>> {
@@ -950,6 +1740,7 @@ mod tests {
             },
             RankBy::BaseCollisions,
             20,
+            0,
         )
         .unwrap();
         // top_k is capped at the smaller of top_k and seeds_evaluated.
@@ -966,6 +1757,7 @@ mod tests {
             SweepMode::Linear { start: 0, count: 0 },
             RankBy::BaseCollisions,
             20,
+            0,
         );
         assert!(res.is_err());
     }
@@ -979,6 +1771,7 @@ mod tests {
             None,
             SweepMode::Linear { start: 0, count: 4 },
             RankBy::BaseCollisions,
+            0,
             0,
         );
         assert!(res.is_err());
@@ -997,6 +1790,7 @@ mod tests {
             },
             RankBy::BaseCollisions,
             10,
+            0,
         )
         .unwrap();
         let b = search_seeds(
@@ -1008,6 +1802,7 @@ mod tests {
             },
             RankBy::BaseCollisions,
             10,
+            0,
         )
         .unwrap();
         assert_eq!(a.top_k.len(), b.top_k.len());
@@ -1030,6 +1825,7 @@ mod tests {
             },
             RankBy::BaseCollisions,
             20,
+            0,
         )
         .unwrap();
         for i in 1..report.top_k.len() {
@@ -1055,6 +1851,7 @@ mod tests {
             },
             RankBy::BaseCollisions,
             5,
+            0,
         )
         .unwrap();
         assert!(report.perturbation_top_k.len() <= 5);
@@ -1122,5 +1919,49 @@ mod tests {
             }
             assert!(c.is_ascii_digit(), "non-digit at index {}: {}", i, c);
         }
+    }
+
+    // --- a cargo test for perturb_seed_search ---
+
+    #[test]
+    fn test_perturb_seed_search_basic_shape() {
+        // Project-level: this test verifies the structural contract of
+        // `perturb_seed_search` — that the returned report has exactly
+        // one Phase-1 entry (the user-supplied seed), that the perturbed
+        // pool is non-empty and capped at top_k, that every survivor has
+        // a structural report attached, and that all reported seeds are
+        // valid single-bit flips of the input seed. It does NOT assert
+        // anything about which seed wins; the relative ranking depends
+        // on the corpus and is not the contract under test.
+        let owned = tiny_corpus();
+        let refs = tiny_corpus_refs(&owned);
+
+        let base_seed: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        let report = perturb_seed_search(base_seed, &refs, None, RankBy::BaseCollisions, 5, 0)
+            .expect("perturb_seed_search should succeed on a non-empty corpus");
+
+        // Phase-1 contract.
+        assert_eq!(report.top_k.len(), 1);
+        assert_eq!(report.top_k[0].seed, base_seed);
+        assert!(report.top_k[0].structural.is_some());
+
+        // Phase-3 contract.
+        assert!(!report.perturbation_top_k.is_empty());
+        assert!(report.perturbation_top_k.len() <= 5);
+
+        // Every Phase-3 seed must differ from `base_seed` by exactly one
+        // bit (Hamming distance 1).
+        for entry in report.perturbation_top_k.iter() {
+            let xor_diff: u64 = entry.seed ^ base_seed;
+            assert_eq!(
+                xor_diff.count_ones(),
+                1,
+                "perturbed seed must be one bit away from base seed"
+            );
+            assert!(entry.structural.is_some());
+        }
+
+        // Seeds_evaluated must reflect the documented constant.
+        assert_eq!(report.seeds_evaluated, 65);
     }
 }
