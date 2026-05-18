@@ -11,6 +11,8 @@ such as:
 - granular scale: 3 byte or 5 byte are no issue
 - potentially larger effective scale: the size of a single-hash from 128, to 256, to 512, to 1024, to 2048, etc. becomes problematic for real-world memory. But an array can easily be made and used at affectively longer lengths. E.g. How many pearson-hashes could you generate in the amount of time needed to make one sha256 hash? Quite a few.
 
+#### Note:
+- For uses where the salt does not need to be very unique, a u8 hash will work as well as u128 to make a different salted result
 
 ## Contents
 
