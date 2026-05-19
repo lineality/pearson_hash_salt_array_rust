@@ -202,7 +202,9 @@ pub const PEARSON_1990_TABLE: [u8; 256] = [
 /// PRNG initializers). It has no special cryptographic meaning here;
 /// it is simply a well-mixed, well-known nonzero constant.
 // const GENERATED_TABLE_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
-const GENERATED_TABLE_SEED: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+// const GENERATED_TABLE_SEED: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+// (chess-board-tested seed) 0x1424_1312_FCC6_8202,  base chi2 == 163.52
+const GENERATED_TABLE_SEED: u64 = 0x1424_1312_FCC6_8202;
 
 /// A 256-byte permutation table generated at compile time via seeded
 /// Fisher-Yates shuffle.
